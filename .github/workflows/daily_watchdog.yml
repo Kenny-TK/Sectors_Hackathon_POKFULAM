@@ -1,0 +1,39 @@
+name: IDX Daily Market Watchdog
+
+on:
+  schedule:
+    # 0 10 * * 1-5 UTC = 17:00 WIB (Jakarta), Monday-Friday, after IDX close.
+    - cron: "0 10 * * 1-5"
+  workflow_dispatch: {} # allows manual "Run workflow" button for testing
+
+permissions:
+  contents: read
+
+jobs:
+  run-watchdog:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run IDX watchdog
+        env:
+          SECTORS_API_KEY: ${{ secrets.SECTORS_API_KEY }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          # Optional overrides -- uncomment / set as repo variables if needed:
+          # LLM_PROVIDER: "openai"      # or "gemini"
+          # OPENAI_MODEL: "gpt-4o-mini"
+          # GEMINI_MODEL: "gemini-1.5-flash"
+        run: python watchdog.py
