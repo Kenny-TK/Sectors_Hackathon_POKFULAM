@@ -2,7 +2,8 @@
 """Vex-Watcher: token-frugal IDX daily market watchdog.
 
 Pipeline:
-  1. Fetch raw data from the Sectors API (foreign flow, top brokers, broker activity).
+  1. Fetch raw data from the Sectors API v2 (/v2/foreign-flow/, /v2/brokers/top/,
+     /v2/broker-summary/{symbol}/top/, /v2/daily/{symbol}/).
   2. Filter deterministically in Python (0 LLM tokens) down to a handful of tickers.
   3. Send ONLY a tiny dict to an LLM for a 2-sentence strategic summary.
   4. Post a Rich Embed to Discord as "Vex-Watcher".
@@ -42,17 +43,15 @@ except ImportError:  # pragma: no cover
 # Configuration
 # --------------------------------------------------------------------------- #
 SECTORS_BASE_URL = "https://api.sectors.app"
-# Endpoints requested in the spec. Adjust paths/params here if your plan differs.
-ENDPOINTS: dict[str, tuple[str, dict[str, Any]]] = {
-    "foreign_flow": ("/v2/daily-foreign-flow/", {}),
-    "top_brokers": ("/v2/top-brokers/", {}),
-    "broker_activity": ("/v2/broker-activity/", {}),
-}
 
 TOP_N = 5                 # tickers shown per list in Discord
 LLM_TOP_N = 3             # tickers passed to the LLM (keeps input < 100 tokens)
-MIN_ACCUM_RATIO = 2.0     # buy_value / sell_value threshold
-MIN_VOLUME_SPIKE = 1.5    # volume / avg_volume threshold
+MAX_CANDIDATES = 5        # top foreign-buy tickers deep-checked for accumulation
+BROKER_TOP_N = 5          # top buyers / sellers per ticker used for the ratio
+VOLUME_LOOKBACK_DAYS = 30 # window for the average-volume baseline
+MIN_BASELINE_DAYS = 5     # minimum prior trading days needed to trust the baseline
+MIN_ACCUM_RATIO = 2.0     # top-buyer net inflow / top-seller net outflow
+MIN_VOLUME_SPIKE = 1.5    # latest volume / average prior volume
 HTTP_TIMEOUT = (5, 20)    # (connect, read) seconds
 
 SYSTEM_PROMPT = (
@@ -63,19 +62,6 @@ SYSTEM_PROMPT = (
 
 WIB = timezone(timedelta(hours=7))
 BOT_NAME = "Vex-Watcher"
-
-# The Sectors response schema for these endpoints can vary, so field lookups accept
-# several candidate names. Add your real field names here if needed.
-TICKER_KEYS = ("symbol", "ticker", "stock", "code", "stock_code")
-FOREIGN_NET_KEYS = ("net_foreign", "net_foreign_value", "foreign_net", "net_foreign_flow", "foreign_net_value")
-FOREIGN_BUY_KEYS = ("foreign_buy", "foreign_buy_value")
-FOREIGN_SELL_KEYS = ("foreign_sell", "foreign_sell_value")
-BROKER_KEYS = ("broker_code", "broker", "code_broker", "broker_id")
-BUY_KEYS = ("buy_value", "buy", "b_val", "total_buy_value", "buy_amount")
-SELL_KEYS = ("sell_value", "sell", "s_val", "total_sell_value", "sell_amount")
-NET_KEYS = ("net_value", "net", "net_buy", "net_amount")
-VOLUME_KEYS = ("volume", "total_volume")
-AVG_VOLUME_KEYS = ("avg_volume", "average_volume", "volume_avg", "avg_volume_20d")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("vex-watcher")
@@ -122,10 +108,15 @@ class ForeignFlow(BaseModel):
     net_value: float  # IDR; positive = net buy, negative = net sell
 
 
+class BrokerFlow(BaseModel):
+    code: str
+    net_value: float  # IDR, signed
+
+
 class Accumulation(BaseModel):
     ticker: str
-    ratio: float                     # buy_value / sell_value (capped at 99)
-    volume_spike: Optional[float] = None
+    ratio: float                     # top-buyer net inflow / top-seller net outflow (capped at 99)
+    volume_spike: Optional[float] = None  # latest volume / average prior volume
     buyers: list[str] = Field(default_factory=list)  # top net-buying broker codes
 
 
@@ -135,11 +126,12 @@ class Findings(BaseModel):
     foreign_buys: list[ForeignFlow] = Field(default_factory=list)
     foreign_sells: list[ForeignFlow] = Field(default_factory=list)
     accumulations: list[Accumulation] = Field(default_factory=list)
-    top_brokers: list[str] = Field(default_factory=list)
+    top_brokers: list[BrokerFlow] = Field(default_factory=list)
+    trade_date: Optional[str] = None
 
 
 # --------------------------------------------------------------------------- #
-# Step 1: Fetch market data
+# Step 1: Fetch market data (Sectors API v2)
 # --------------------------------------------------------------------------- #
 def build_session() -> requests.Session:
     """Session with automatic retries for transient errors (429/5xx)."""
@@ -154,21 +146,10 @@ def build_session() -> requests.Session:
     return session
 
 
-def _extract_rows(payload: Any) -> list[dict[str, Any]]:
-    """Normalise a JSON payload to a list of dict rows."""
-    if isinstance(payload, list):
-        return [r for r in payload if isinstance(r, dict)]
-    if isinstance(payload, dict):
-        for key in ("results", "data", "items", "records"):
-            inner = payload.get(key)
-            if isinstance(inner, (list, dict)):
-                return _extract_rows(inner)
-    return []
-
-
-def fetch_rows(session: requests.Session, api_key: str, name: str) -> Optional[list[dict[str, Any]]]:
-    """GET one Sectors endpoint. Returns None on any failure (never raises)."""
-    path, params = ENDPOINTS[name]
+def get_json(
+    session: requests.Session, api_key: str, path: str, params: dict[str, Any], label: str
+) -> Optional[Any]:
+    """GET a Sectors endpoint and return parsed JSON, or None on any failure (never raises)."""
     try:
         resp = session.get(
             f"{SECTORS_BASE_URL}{path}",
@@ -177,124 +158,116 @@ def fetch_rows(session: requests.Session, api_key: str, name: str) -> Optional[l
             timeout=HTTP_TIMEOUT,
         )
     except requests.Timeout:
-        log.error("[%s] request timed out", name)
+        log.error("[%s] request timed out", label)
         return None
     except requests.RequestException as exc:
-        log.error("[%s] request failed: %s", name, type(exc).__name__)
+        log.error("[%s] request failed: %s", label, type(exc).__name__)
         return None
 
     if resp.status_code != 200:
-        log.error("[%s] HTTP %s: %s", name, resp.status_code, resp.text[:200])
+        log.error("[%s] HTTP %s: %s", label, resp.status_code, resp.text[:200])
         return None
     try:
-        return _extract_rows(resp.json())
+        return resp.json()
     except ValueError:
-        log.error("[%s] response was not valid JSON", name)
+        log.error("[%s] response was not valid JSON", label)
+        return None
+
+
+def _rows(payload: Any) -> list[dict[str, Any]]:
+    """Rows from either a bare list or a {"results": [...]} envelope."""
+    if isinstance(payload, dict):
+        payload = payload.get("results", [])
+    return [r for r in payload if isinstance(r, dict)] if isinstance(payload, list) else []
+
+
+def _bare(symbol: str) -> str:
+    """'ANTM.JK' -> 'ANTM'."""
+    s = symbol.strip().upper()
+    return s[:-3] if s.endswith(".JK") else s
+
+
+def _f(value: Any) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
         return None
 
 
 # --------------------------------------------------------------------------- #
 # Step 2: Deterministic filtering (0 LLM tokens)
 # --------------------------------------------------------------------------- #
-def _num(row: dict[str, Any], keys: Iterable[str]) -> Optional[float]:
-    for k in keys:
-        v = row.get(k)
-        if v is None:
+def parse_foreign_flow(payload: Any, want_buys: bool) -> tuple[list[ForeignFlow], Optional[str]]:
+    """Parse /v2/foreign-flow/ rows. Returns (flows, trading_date)."""
+    flows: list[ForeignFlow] = []
+    trade_date: Optional[str] = None
+    for row in _rows(payload):
+        symbol, net = row.get("symbol"), _f(row.get("net_foreign_inflow"))
+        if not isinstance(symbol, str) or net is None:
             continue
-        try:
-            return float(v)
-        except (TypeError, ValueError):
-            continue
-    return None
+        trade_date = trade_date or row.get("date")
+        if (net > 0) == want_buys and net != 0:
+            flows.append(ForeignFlow(ticker=_bare(symbol), net_value=net))
+    flows.sort(key=lambda f: f.net_value, reverse=want_buys)
+    return flows[:TOP_N], trade_date
 
 
-def _txt(row: dict[str, Any], keys: Iterable[str]) -> Optional[str]:
-    for k in keys:
-        v = row.get(k)
-        if isinstance(v, str) and v.strip():
-            return v.strip().upper()
-    return None
+def parse_top_brokers(payload: Any, n: int = TOP_N) -> list[BrokerFlow]:
+    """Top net-buying brokers from /v2/brokers/top/ (ranked by signed net value)."""
+    brokers = [
+        BrokerFlow(code=str(r["broker_code"]).upper(), net_value=net)
+        for r in _rows(payload)
+        if r.get("broker_code") and (net := _f(r.get("net"))) is not None and net > 0
+    ]
+    brokers.sort(key=lambda b: b.net_value, reverse=True)
+    return brokers[:n]
 
 
-def _ticker(row: dict[str, Any]) -> Optional[str]:
-    t = _txt(row, TICKER_KEYS)
-    return t[:-3] if t and t.endswith(".JK") else t
-
-
-def top_foreign_flows(rows: list[dict[str, Any]], n: int = TOP_N) -> tuple[list[ForeignFlow], list[ForeignFlow]]:
-    """Top-n net foreign buys and sells (rows for the same ticker are summed)."""
-    totals: dict[str, float] = defaultdict(float)
-    for row in rows:
-        ticker = _ticker(row)
-        net = _num(row, FOREIGN_NET_KEYS)
-        if net is None:
-            buy, sell = _num(row, FOREIGN_BUY_KEYS), _num(row, FOREIGN_SELL_KEYS)
-            net = buy - sell if buy is not None and sell is not None else None
-        if ticker and net is not None:
-            totals[ticker] += net
-
-    flows = [ForeignFlow(ticker=t, net_value=v) for t, v in totals.items()]
-    buys = sorted((f for f in flows if f.net_value > 0), key=lambda f: f.net_value, reverse=True)[:n]
-    sells = sorted((f for f in flows if f.net_value < 0), key=lambda f: f.net_value)[:n]
-    return buys, sells
-
-
-def find_accumulations(rows: list[dict[str, Any]], n: int = TOP_N) -> list[Accumulation]:
-    """Tickers with accumulation ratio > 2.0x OR volume spike > 1.5x, plus key buyer brokers."""
-    agg: dict[str, dict[str, Any]] = defaultdict(
-        lambda: {"buy": 0.0, "sell": 0.0, "vol": None, "avg": None, "brokers": defaultdict(float)}
+def volume_spike(daily_payload: Any, trade_date: Optional[str]) -> Optional[float]:
+    """Latest volume / mean of prior volumes from /v2/daily/{symbol}/ (None if baseline too thin)."""
+    rows = sorted(
+        (r for r in _rows(daily_payload) if r.get("date") and _f(r.get("volume")) is not None),
+        key=lambda r: r["date"],
     )
-    for row in rows:
-        ticker = _ticker(row)
-        if not ticker:
-            continue
-        a = agg[ticker]
-        buy = _num(row, BUY_KEYS) or 0.0
-        sell = _num(row, SELL_KEYS) or 0.0
-        net = _num(row, NET_KEYS)
-        a["buy"] += buy
-        a["sell"] += sell
-        # Volume fields are per-ticker (repeated on each broker row), so take the max.
-        for slot, keys in (("vol", VOLUME_KEYS), ("avg", AVG_VOLUME_KEYS)):
-            v = _num(row, keys)
-            if v is not None:
-                a[slot] = max(a[slot] or 0.0, v)
-        code = _txt(row, BROKER_KEYS)
-        if code:
-            a["brokers"][code] += net if net is not None else buy - sell
-
-    results: list[tuple[float, Accumulation]] = []
-    for ticker, a in agg.items():
-        ratio = a["buy"] / a["sell"] if a["sell"] > 0 else (99.0 if a["buy"] > 0 else 0.0)
-        ratio = min(ratio, 99.0)
-        spike = a["vol"] / a["avg"] if a["vol"] and a["avg"] else None
-        if not (ratio > MIN_ACCUM_RATIO or (spike is not None and spike > MIN_VOLUME_SPIKE)):
-            continue
-        buyers = [c for c, v in sorted(a["brokers"].items(), key=lambda kv: kv[1], reverse=True) if v > 0][:3]
-        score = max(ratio / MIN_ACCUM_RATIO, (spike or 0.0) / MIN_VOLUME_SPIKE)
-        results.append((score, Accumulation(ticker=ticker, ratio=ratio, volume_spike=spike, buyers=buyers)))
-
-    results.sort(key=lambda x: x[0], reverse=True)
-    return [acc for _, acc in results[:n]]
+    if trade_date:
+        rows = [r for r in rows if r["date"] <= trade_date]
+    if len(rows) < MIN_BASELINE_DAYS + 1:
+        return None
+    latest = float(rows[-1]["volume"])
+    prior = [float(r["volume"]) for r in rows[:-1] if float(r["volume"]) > 0]
+    if len(prior) < MIN_BASELINE_DAYS:
+        return None
+    return latest / (sum(prior) / len(prior))
 
 
-def top_broker_codes(rows: list[dict[str, Any]], n: int = TOP_N) -> list[str]:
-    """Broker codes ranked by net value (falls back to buy value, then API order)."""
-    scored: list[tuple[float, str]] = []
-    for i, row in enumerate(rows):
-        code = _txt(row, BROKER_KEYS)
-        if not code:
-            continue
-        score = _num(row, NET_KEYS)
-        if score is None:
-            score = _num(row, BUY_KEYS)
-        scored.append((score if score is not None else -float(i), code))
-    scored.sort(key=lambda x: x[0], reverse=True)
-    seen: list[str] = []
-    for _, code in scored:
-        if code not in seen:
-            seen.append(code)
-    return seen[:n]
+def evaluate_accumulation(symbol: str, summary_payload: Any, daily_payload: Any, trade_date: Optional[str]) -> Optional[Accumulation]:
+    """Build an Accumulation if the ticker crosses either threshold, else None.
+
+    Accumulation ratio = net IDR bought by the top buyers / net IDR sold by the top sellers
+    (from /v2/broker-summary/{symbol}/top/). > 2.0 means buying pressure clearly dominates.
+    """
+    if not isinstance(summary_payload, dict):
+        return None
+    buyers = [b for b in summary_payload.get("top_buyers") or [] if isinstance(b, dict)]
+    sellers = [s for s in summary_payload.get("top_sellers") or [] if isinstance(s, dict)]
+    buy_net = sum(max(_f(b.get("net_idr")) or 0.0, 0.0) for b in buyers)
+    sell_net = abs(sum(min(_f(s.get("net_idr")) or 0.0, 0.0) for s in sellers))
+    ratio = min(buy_net / sell_net, 99.0) if sell_net > 0 else (99.0 if buy_net > 0 else 0.0)
+    spike = volume_spike(daily_payload, trade_date)
+
+    if not (ratio > MIN_ACCUM_RATIO or (spike is not None and spike > MIN_VOLUME_SPIKE)):
+        return None
+    codes = [str(b["broker_code"]).upper() for b in buyers if b.get("broker_code") and (_f(b.get("net_idr")) or 0) > 0]
+    return Accumulation(ticker=_bare(symbol), ratio=ratio, volume_spike=spike, buyers=codes[:3])
+
+
+def rank_accumulations(items: list[Accumulation], n: int = TOP_N) -> list[Accumulation]:
+    """Strongest signal first, whichever threshold it exceeded by the larger margin."""
+    return sorted(
+        items,
+        key=lambda a: max(a.ratio / MIN_ACCUM_RATIO, (a.volume_spike or 0.0) / MIN_VOLUME_SPIKE),
+        reverse=True,
+    )[:n]
 
 
 def llm_payload(f: Findings) -> dict[str, Any]:
@@ -404,7 +377,9 @@ def _accumulation_text(f: Findings) -> str:
             items.append(f"• **{a.ticker}**: {' · '.join(parts)} · buyers: {buyers}")
         text = "\n".join(items)
     if f.top_brokers:
-        text += "\n\n**Top brokers:** " + ", ".join(f"`{b}`" for b in f.top_brokers)
+        text += "\n\n**Top net-buying brokers:** " + ", ".join(
+            f"`{b.code}` {fmt_idr(b.net_value)}" for b in f.top_brokers
+        )
     return text
 
 
@@ -466,37 +441,77 @@ def main() -> int:
     settings = Settings.from_env()
     now = datetime.now(timezone.utc)
     session = build_session()
+    key = settings.sectors_api_key
+    failed: list[str] = []
 
-    raw = {name: fetch_rows(session, settings.sectors_api_key, name) for name in ENDPOINTS}
-    failed = [name for name, rows in raw.items() if rows is None]
+    # --- Step 1: top-level market-wide calls (4 credits total) ---
+    buys_payload = get_json(session, key, "/v2/foreign-flow/", {"limit": TOP_N}, "foreign_buys")
+    sells_payload = get_json(
+        session, key, "/v2/foreign-flow/", {"order_by": "net_foreign_inflow", "limit": TOP_N}, "foreign_sells"
+    )
+    brokers_payload = get_json(session, key, "/v2/brokers/top/", {"metric": "net"}, "top_brokers")
+    top_level_failures = sum(p is None for p in (buys_payload, sells_payload, brokers_payload))
+    if buys_payload is None or sells_payload is None:
+        failed.append("foreign_flow")
+    if brokers_payload is None:
+        failed.append("top_brokers")
 
+    # --- Step 2: deterministic filtering ---
     findings = Findings()
-    if raw["foreign_flow"]:
-        findings.foreign_buys, findings.foreign_sells = top_foreign_flows(raw["foreign_flow"])
-    if raw["broker_activity"]:
-        findings.accumulations = find_accumulations(raw["broker_activity"])
-    if raw["top_brokers"]:
-        findings.top_brokers = top_broker_codes(raw["top_brokers"])
+    findings.foreign_buys, buy_date = parse_foreign_flow(buys_payload, want_buys=True)
+    findings.foreign_sells, sell_date = parse_foreign_flow(sells_payload, want_buys=False)
+    findings.trade_date = buy_date or sell_date
+    findings.top_brokers = parse_top_brokers(brokers_payload)
+
+    # Deep-check the top foreign-buy tickers for accumulation / volume spikes.
+    if findings.trade_date:
+        end = datetime.strptime(findings.trade_date, "%Y-%m-%d")
+        baseline_start = (end - timedelta(days=VOLUME_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
+        hits: list[Accumulation] = []
+        for flow in findings.foreign_buys[:MAX_CANDIDATES]:
+            summary = get_json(
+                session, key, f"/v2/broker-summary/{flow.ticker}/top/",
+                {"start": findings.trade_date, "end": findings.trade_date, "n_brokers": BROKER_TOP_N},
+                f"broker_summary:{flow.ticker}",
+            )
+            daily = get_json(
+                session, key, f"/v2/daily/{flow.ticker}/",
+                {"start": baseline_start, "end": findings.trade_date},
+                f"daily:{flow.ticker}",
+            )
+            if summary is None and "broker_summary" not in failed:
+                failed.append("broker_summary")
+            if daily is None and "daily" not in failed:
+                failed.append("daily")
+            if summary is None and daily is None:
+                continue
+            hit = evaluate_accumulation(flow.ticker, summary, daily, findings.trade_date)
+            if hit:
+                hits.append(hit)
+        findings.accumulations = rank_accumulations(hits)
+
     log.info(
-        "Findings: %d buys, %d sells, %d accumulations",
-        len(findings.foreign_buys), len(findings.foreign_sells), len(findings.accumulations),
+        "Findings (%s): %d buys, %d sells, %d accumulations",
+        findings.trade_date, len(findings.foreign_buys), len(findings.foreign_sells), len(findings.accumulations),
     )
 
+    # --- Step 3: LLM summary (only if there is something to say) ---
     has_data = bool(findings.foreign_buys or findings.foreign_sells or findings.accumulations)
-    summary = summarize(settings, llm_payload(findings)) if has_data else None
-    if has_data and summary is None:
+    summary_text = summarize(settings, llm_payload(findings)) if has_data else None
+    if has_data and summary_text is None:
         failed.append("llm")
 
-    if len(failed) >= len(ENDPOINTS):
+    if top_level_failures == 3:
         status = "FAILED (" + ", ".join(failed) + ")"
     elif failed:
         status = "DEGRADED (" + ", ".join(failed) + ")"
     elif not has_data:
-        status = "OK (no anomalies; market may be closed)"
+        status = "OK (no data returned; market may be closed)"
     else:
         status = "OK"
 
-    sent = post_discord(settings.discord_webhook_url, build_payload(settings, findings, summary, status, now))
+    # --- Step 4: Discord ---
+    sent = post_discord(settings.discord_webhook_url, build_payload(settings, findings, summary_text, status, now))
     log.info("Pipeline status: %s | Discord delivered: %s", status, sent)
     return 0 if sent and not status.startswith("FAILED") else 1
 
