@@ -17,6 +17,7 @@ Optional env vars:
 """
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import os
@@ -289,7 +290,12 @@ def _enforce_two_sentences(text: str) -> Optional[str]:
     return " ".join(sentences[:2]) if len(sentences) >= 2 else None
 
 
-GEMINI_FALLBACK_MODELS = ("gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-3-flash-preview")
+GEMINI_FALLBACK_MODELS = (
+    "gemini-3.5-flash-lite",
+    "gemini-3.8-flash",
+    "gemini-3-flash-preview",
+    "gemini-2.5-flash-lite",  # retired for new users; kept for older accounts
+)
 
 
 def _call_llm(settings: Settings, provider: str, model: str, user_prompt: str) -> str:
@@ -301,12 +307,15 @@ def _call_llm(settings: Settings, provider: str, model: str, user_prompt: str) -
             json={
                 "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
                 "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
-                "generationConfig": {"maxOutputTokens": 200, "temperature": 0.4},
+                "generationConfig": {"maxOutputTokens": 1024, "temperature": 0.4},
             },
             timeout=HTTP_TIMEOUT,
         )
         resp.raise_for_status()
-        return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+        cand = resp.json()["candidates"][0]
+        if cand.get("finishReason") == "MAX_TOKENS":
+            raise ValueError("output truncated (finishReason=MAX_TOKENS)")
+        return "".join(p.get("text", "") for p in cand["content"]["parts"])
     resp = requests.post(
         "https://api.openai.com/v1/chat/completions",
         headers={"Authorization": f"Bearer {settings.llm_api_key}"},
@@ -466,7 +475,67 @@ def post_discord(webhook_url: str, payload: dict[str, Any]) -> bool:
 # --------------------------------------------------------------------------- #
 # Orchestration
 # --------------------------------------------------------------------------- #
-def main() -> int:
+# --------------------------------------------------------------------------- #
+# Offline mock mode (--mock): zero Sectors credits, same response shapes as the real API
+# --------------------------------------------------------------------------- #
+_MOCK_DATE = "2026-09-28"
+_MOCK_BUYS = [("BBCA", 1.2e12), ("BMRI", 6.4e11), ("ANTM", 3.0e11), ("TLKM", 1.9e11), ("ASII", 1.1e11)]
+_MOCK_SELLS = [("GOTO", -3.1e11), ("ADRO", -2.2e11), ("UNVR", -1.4e11), ("ICBP", -9.0e10), ("BUKA", -6.0e10)]
+# symbol -> (top-buyer net IDR, top-seller net IDR, latest volume multiple of baseline)
+_MOCK_SIGNALS = {"ANTM": (4.0e11, 1.0e11, 2.5), "BBCA": (6.0e11, 5.0e11, 1.1), "BMRI": (2.0e11, 1.5e11, 1.6)}
+
+
+def mock_get_json(session: Any, api_key: str, path: str, params: dict[str, Any], label: str) -> Optional[Any]:
+    """Drop-in replacement for get_json() returning fabricated, schema-accurate data."""
+    log.info("[mock] %s", label)
+    if path == "/v2/foreign-flow/":
+        picks = _MOCK_SELLS if params.get("order_by") else _MOCK_BUYS
+        rows = [
+            {"symbol": f"{t}.JK", "date": _MOCK_DATE, "net_foreign_inflow": int(v),
+             "foreign_buy_idr": int(abs(v) * 2), "foreign_sell_idr": int(abs(v))}
+            for t, v in picks
+        ]
+        return {"results": rows, "pagination": {"has_next": False}}
+    if path == "/v2/brokers/top/":
+        codes = [("AK", -3.0e11), ("YP", 5.0e11), ("PD", 2.4e11), ("CC", 1.1e11), ("KZ", 9.0e10), ("BK", -2.0e11)]
+        return {"date": _MOCK_DATE, "results": [
+            {"rank": i + 1, "broker_code": c, "gross": 1_000_000_000_000, "net": int(n),
+             "foreign_gross": 0, "foreign_net": 0} for i, (c, n) in enumerate(codes)]}
+    symbol = path.split("/")[3]
+    buy, sell, mult = _MOCK_SIGNALS.get(symbol, (1.0e11, 1.0e11, 1.0))
+    if "/broker-summary/" in path:
+        return {
+            "symbol": f"{symbol}.JK",
+            "top_buyers": [
+                {"rank": 1, "broker_code": "YP", "net_idr": int(buy), "buy_idr": 0, "sell_idr": 0},
+                {"rank": 2, "broker_code": "PD", "net_idr": int(buy / 2), "buy_idr": 0, "sell_idr": 0},
+            ],
+            "top_sellers": [{"rank": 1, "broker_code": "BK", "net_idr": -int(sell), "buy_idr": 0, "sell_idr": 0}],
+        }
+    if "/daily/" in path:
+        base = [{"symbol": f"{symbol}.JK", "date": f"2026-09-{d:02d}", "volume": 10_000_000} for d in range(10, 28)]
+        return base + [{"symbol": f"{symbol}.JK", "date": _MOCK_DATE, "volume": int(10_000_000 * mult)}]
+    return None
+
+
+def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Vex-Watcher IDX daily watchdog")
+    p.add_argument("--mock", action="store_true", help="use built-in fake Sectors data (0 Sectors credits)")
+    p.add_argument("--no-llm", action="store_true", help="skip the LLM call (needs no LLM key)")
+    p.add_argument("--dry-run", action="store_true", help="print the Discord payload instead of posting it")
+    return p.parse_args(argv)
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    args = parse_args(argv)
+    # Keys that a given test mode does not use become optional placeholders.
+    if args.mock:
+        os.environ.setdefault("SECTORS_API_KEY", "mock")
+    if args.no_llm:
+        os.environ.setdefault("LLM_API_KEY", "unused")
+    if args.dry_run:
+        os.environ.setdefault("DISCORD_WEBHOOK_URL", "unused")
+    fetch = mock_get_json if args.mock else get_json
     settings = Settings.from_env()
     now = datetime.now(timezone.utc)
     session = build_session()
@@ -474,11 +543,11 @@ def main() -> int:
     failed: list[str] = []
 
     # --- Step 1: top-level market-wide calls (4 credits total) ---
-    buys_payload = get_json(session, key, "/v2/foreign-flow/", {"limit": TOP_N}, "foreign_buys")
-    sells_payload = get_json(
+    buys_payload = fetch(session, key, "/v2/foreign-flow/", {"limit": TOP_N}, "foreign_buys")
+    sells_payload = fetch(
         session, key, "/v2/foreign-flow/", {"order_by": "net_foreign_inflow", "limit": TOP_N}, "foreign_sells"
     )
-    brokers_payload = get_json(session, key, "/v2/brokers/top/", {"metric": "net"}, "top_brokers")
+    brokers_payload = fetch(session, key, "/v2/brokers/top/", {"metric": "net"}, "top_brokers")
     top_level_failures = sum(p is None for p in (buys_payload, sells_payload, brokers_payload))
     if buys_payload is None or sells_payload is None:
         failed.append("foreign_flow")
@@ -498,12 +567,12 @@ def main() -> int:
         baseline_start = (end - timedelta(days=VOLUME_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
         hits: list[Accumulation] = []
         for flow in findings.foreign_buys[:MAX_CANDIDATES]:
-            summary = get_json(
+            summary = fetch(
                 session, key, f"/v2/broker-summary/{flow.ticker}/top/",
                 {"start": findings.trade_date, "end": findings.trade_date, "n_brokers": BROKER_TOP_N},
                 f"broker_summary:{flow.ticker}",
             )
-            daily = get_json(
+            daily = fetch(
                 session, key, f"/v2/daily/{flow.ticker}/",
                 {"start": baseline_start, "end": findings.trade_date},
                 f"daily:{flow.ticker}",
@@ -526,8 +595,8 @@ def main() -> int:
 
     # --- Step 3: LLM summary (only if there is something to say) ---
     has_data = bool(findings.foreign_buys or findings.foreign_sells or findings.accumulations)
-    summary_text = summarize(settings, llm_payload(findings)) if has_data else None
-    if has_data and summary_text is None:
+    summary_text = summarize(settings, llm_payload(findings)) if has_data and not args.no_llm else None
+    if has_data and not args.no_llm and summary_text is None:
         failed.append("llm")
 
     if top_level_failures == 3:
@@ -540,7 +609,14 @@ def main() -> int:
         status = "OK"
 
     # --- Step 4: Discord ---
-    sent = post_discord(settings.discord_webhook_url, build_payload(settings, findings, summary_text, status, now))
+    if args.mock:
+        status += " · MOCK DATA"
+    payload = build_payload(settings, findings, summary_text, status, now)
+    if args.dry_run:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        sent = True
+    else:
+        sent = post_discord(settings.discord_webhook_url, payload)
     log.info("Pipeline status: %s | Discord delivered: %s", status, sent)
     return 0 if sent and not status.startswith("FAILED") else 1
 
