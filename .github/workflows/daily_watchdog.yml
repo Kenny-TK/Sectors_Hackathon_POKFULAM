@@ -1,0 +1,43 @@
+name: Vex-Watcher Daily IDX Watchdog
+
+on:
+  schedule:
+    # 10:00 UTC = 17:00 WIB (Jakarta), Monday-Friday, after IDX market close.
+    # Note: GitHub cron can be delayed by several minutes under load.
+    - cron: "0 10 * * 1-5"
+  workflow_dispatch: # Manual trigger for testing
+
+permissions:
+  contents: read
+
+concurrency:
+  group: daily-watchdog
+  cancel-in-progress: false
+
+jobs:
+  watchdog:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run watchdog
+        env:
+          SECTORS_API_KEY: ${{ secrets.SECTORS_API_KEY }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          # Optional (repo Variables, not Secrets): AVATAR_URL, LLM_PROVIDER, LLM_MODEL
+          AVATAR_URL: ${{ vars.AVATAR_URL }}
+          LLM_PROVIDER: ${{ vars.LLM_PROVIDER }}
+          LLM_MODEL: ${{ vars.LLM_MODEL }}
+        run: python watchdog.py
