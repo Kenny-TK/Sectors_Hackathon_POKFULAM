@@ -12,7 +12,7 @@ Required env vars (GitHub Secrets):
   SECTORS_API_KEY, LLM_API_KEY, DISCORD_WEBHOOK_URL
 Optional env vars:
   AVATAR_URL    - public URL of the avatar image (defaults to image.png in this repo's raw URL)
-  LLM_PROVIDER  - "openai" or "gemini" (auto-detected from key prefix if unset)
+  LLM_PROVIDER  - "openai" or "gemini" (keys starting "sk-" => openai, anything else => gemini)
   LLM_MODEL     - override the default model name
 """
 from __future__ import annotations
@@ -332,7 +332,9 @@ def summarize(settings: Settings, payload: dict[str, Any]) -> Optional[str]:
     several Flash-tier models in order. Temporary 503/429 responses get one short retry.
     """
     user_prompt = json.dumps(payload, separators=(",", ":"))
-    provider = settings.llm_provider or ("gemini" if settings.llm_api_key.startswith("AIza") else "openai")
+    # Only "sk-" keys are treated as OpenAI; everything else (AIza..., AQ...) is Gemini.
+    # Set LLM_PROVIDER to override (e.g. for OpenAI-compatible keys with other prefixes).
+    provider = settings.llm_provider or ("openai" if settings.llm_api_key.startswith("sk-") else "gemini")
     if settings.llm_model:
         models: tuple[str, ...] = (settings.llm_model,)
     else:
