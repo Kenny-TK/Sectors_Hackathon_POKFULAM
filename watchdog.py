@@ -289,51 +289,78 @@ def _enforce_two_sentences(text: str) -> Optional[str]:
     return " ".join(sentences[:2]) if len(sentences) >= 2 else None
 
 
+GEMINI_FALLBACK_MODELS = ("gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-3-flash-preview")
+
+
+def _call_llm(settings: Settings, provider: str, model: str, user_prompt: str) -> str:
+    """One LLM request. Raises requests.HTTPError / KeyError / IndexError / ValueError on failure."""
+    if provider == "gemini":
+        resp = requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+            headers={"x-goog-api-key": settings.llm_api_key},
+            json={
+                "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+                "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+                "generationConfig": {"maxOutputTokens": 200, "temperature": 0.4},
+            },
+            timeout=HTTP_TIMEOUT,
+        )
+        resp.raise_for_status()
+        return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+    resp = requests.post(
+        "https://api.openai.com/v1/chat/completions",
+        headers={"Authorization": f"Bearer {settings.llm_api_key}"},
+        json={
+            "model": model,
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            "max_completion_tokens": 200,
+            "temperature": 0.4,
+        },
+        timeout=HTTP_TIMEOUT,
+    )
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"]
+
+
 def summarize(settings: Settings, payload: dict[str, Any]) -> Optional[str]:
-    """Call OpenAI or Gemini. Returns a 2-sentence string, or None on any failure."""
+    """Return a 2-sentence summary, or None if every candidate model fails.
+
+    Gemini free tier: model availability and quotas change, so unless LLM_MODEL is set we try
+    several Flash-tier models in order. Temporary 503/429 responses get one short retry.
+    """
     user_prompt = json.dumps(payload, separators=(",", ":"))
     provider = settings.llm_provider or ("gemini" if settings.llm_api_key.startswith("AIza") else "openai")
-    try:
-        if provider == "gemini":
-            model = settings.llm_model or "gemini-2.5-flash-lite"
-            resp = requests.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-                headers={"x-goog-api-key": settings.llm_api_key},
-                json={
-                    "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
-                    "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
-                    "generationConfig": {"maxOutputTokens": 80, "temperature": 0.4},
-                },
-                timeout=HTTP_TIMEOUT,
-            )
-            resp.raise_for_status()
-            text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
-        else:
-            model = settings.llm_model or "gpt-4o-mini"
-            resp = requests.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={"Authorization": f"Bearer {settings.llm_api_key}"},
-                json={
-                    "model": model,
-                    "messages": [
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    "max_tokens": 60,
-                    "temperature": 0.4,
-                },
-                timeout=HTTP_TIMEOUT,
-            )
-            resp.raise_for_status()
-            text = resp.json()["choices"][0]["message"]["content"]
-    except (requests.RequestException, KeyError, IndexError, ValueError) as exc:
-        log.error("LLM call failed (%s): %s", provider, type(exc).__name__)
-        return None
+    if settings.llm_model:
+        models: tuple[str, ...] = (settings.llm_model,)
+    else:
+        models = GEMINI_FALLBACK_MODELS if provider == "gemini" else ("gpt-4o-mini",)
 
-    summary = _enforce_two_sentences(text)
-    if summary is None:
-        log.error("LLM returned fewer than 2 sentences")
-    return summary
+    for model in models:
+        for attempt in range(2):
+            try:
+                text = _call_llm(settings, provider, model, user_prompt)
+            except requests.HTTPError as exc:
+                code = exc.response.status_code if exc.response is not None else 0
+                body = exc.response.text[:300] if exc.response is not None else ""
+                log.error("LLM call failed (%s, model=%s): HTTP %s: %s", provider, model, code, body)
+                if code in (429, 503) and attempt == 0:
+                    time.sleep(5)  # transient overload / per-minute limit: retry once
+                    continue
+                break  # 404 / 400 / 401 etc.: try the next model
+            except (requests.RequestException, KeyError, IndexError, ValueError) as exc:
+                log.error("LLM response unusable (%s, model=%s): %s %s", provider, model, type(exc).__name__, exc)
+                break
+
+            summary = _enforce_two_sentences(text)
+            if summary:
+                log.info("LLM summary produced by %s", model)
+                return summary
+            log.error("LLM returned fewer than 2 sentences (model=%s): %r", model, text[:200])
+            break
+    return None
 
 
 # --------------------------------------------------------------------------- #
