@@ -10,7 +10,7 @@ Pipeline:
 Required env vars (GitHub Secrets):
   SECTORS_API_KEY, LLM_API_KEY, DISCORD_WEBHOOK_URL
 Optional env vars:
-  AVATAR_URL    - public URL of the avatar image (defaults to image.png in this repo's raw URL)
+  AVATAR_URL    - public URL of the avatar image (defaults to image.jpg in this repo's raw URL)
   LLM_PROVIDER  - "openai" or "gemini" (auto-detected from key prefix if unset)
   LLM_MODEL     - override the default model name
 """
@@ -105,7 +105,7 @@ class Settings(BaseModel):
         repo = os.getenv("GITHUB_REPOSITORY")
         if not avatar and repo:  # works only if the repo is public
             branch = os.getenv("GITHUB_REF_NAME", "main")
-            avatar = f"https://raw.githubusercontent.com/{repo}/{branch}/image.png"
+            avatar = f"https://raw.githubusercontent.com/{repo}/{branch}/image.jpg"
 
         return cls(
             sectors_api_key=os.environ["SECTORS_API_KEY"].strip(),
